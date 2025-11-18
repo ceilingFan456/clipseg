@@ -7,35 +7,9 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from torch.profiler import profile, ProfilerActivity
-
-import torch
-# import requests
-
-# ! wget https://owncloud.gwdg.de/index.php/s/ioHbRzFx6th32hn/download -O weights.zip
-# ! unzip -d weights -j weights.zip
-from models.clipseg import CLIPDensePredT
-from PIL import Image
-from torchvision import transforms
-from matplotlib import pyplot as plt
-
-# load model
-model = CLIPDensePredT(version='ViT-B/16', reduce_dim=64, complex_trans_conv=True)
-model.eval()
-
-# non-strict, because we only stored decoder weights (not CLIP weights)
-model.load_state_dict(torch.load('/home/t-qimhuang/weights/clipseg/rd64-uni-refined.pth'), strict=False)
-
-total = sum(p.numel() for p in model.parameters())
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Total params: {total/1e6:.2f}M | Trainable: {trainable/1e6:.2f}M")
-
-
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    transforms.Resize((352, 352)),
-])
+# ---- import your other file here ----
+# Make sure your Quickstart side exposes: infer_one(image_rgb, user_text) -> mask (H, W)
+import quickstart_infer  # <- you provide this (wrapper around your Quickstart.ipynb)
 
 # ---------------------------
 # Helpers (unchanged behavior)
@@ -85,41 +59,38 @@ def build_output_paths(OUT_BASE: Path, case_name: str, frame_name: str, code: st
 
 def main():
     # ---- configure roots (same semantics as your previous script) ----
-    IN_ROOT  = Path("/home/t-qimhuang/disk/robot_dataset/final_test_set/roboengine_test_video")
-    OUT_BASE = Path("/home/t-qimhuang/disk/robot_dataset/final_test_set/roboengine_test_video_clipseg")
-    # IN_ROOT  = Path("/home/t-qimhuang/disk/robot_dataset/final_test_set/run5_test105")
-    # OUT_BASE = Path("/home/t-qimhuang/disk/robot_dataset/final_test_set/run5_test105_clipseg")
+    # IN_ROOT  = Path("/home/t-qimhuang/disk/robot_dataset/final_test_set/roboengine_test_video")
+    # OUT_BASE = Path("/home/t-qimhuang/disk/robot_dataset/final_test_set/roboengine_test_video_clipseg")
+    IN_ROOT  = Path("/home/t-qimhuang/disk/robot_dataset/final_test_set/run5_test105")
+    OUT_BASE = Path("/home/t-qimhuang/disk/robot_dataset/final_test_set/run5_test105_clipseg")
 
     # keep your code mapping; we’ll pass user_text into your infer function
-    PROMPT_TO_CODE = {"robot arm": "000", "gripper": "001", "robot": "002"}
+    PROMPT_TO_CODE = {"robot": "000", "gripper": "001", "robot arm": "002"}
 
     print("Starting batch inference (linked to quickstart_infer.infer_one)...")
 
-    for image_path, case_name, frame_name in tqdm(list(iter_dataset_images(IN_ROOT)), desc="Processing images"):
-        # Load image
-        input_image = Image.open(image_path)
-        img = transform(input_image).unsqueeze(0)
-        H, W = input_image.size[1], input_image.size[0]
+    for image_path, case_name, frame_name in tqdm(iter_dataset_images(IN_ROOT), desc="Processing images"):
+        # ======= image preproc (unchanged) =======
+        image_np_bgr = cv2.imread(str(image_path))
+        if image_np_bgr is None:
+            print(f"[WARN] Cannot read image: {image_path}")
+            continue
+        image_np = cv2.cvtColor(image_np_bgr, cv2.COLOR_BGR2RGB)
+        # ========================================
 
         # Save ORIGINAL image once (same as before)
         img_dir = OUT_BASE / "image" / case_name
         _ensure_dir(img_dir)
-        # img_path_out = img_dir / frame_name
-        
+        img_path_out = img_dir / frame_name
+        ok = cv2.imwrite(str(img_path_out), image_np_bgr)
+        if not ok:
+            print(f"[ERROR] Failed to save image: {img_path_out}")
+
         # Run your model per prompt and save masks the same way
         for user_text, code in PROMPT_TO_CODE.items():
             # ---------- HOOK into your Quickstart file ----------
             # Expect infer_one to return mask in HxW (bool / {0,1} / float probs / logits)
-            with torch.no_grad():
-                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], 
-                             record_shapes=True, with_flops=True) as prof:
-                    preds = model(img.repeat(1, 1, 1, 1), [user_text])[0]
-                
-                ## output the profiling results
-                print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
-                total_flops = sum([item.flops for item in prof.key_averages()])
-                print(f"Total FLOPs: {total_flops / 1e9:.2f} GFLOPs")
-                mask = torch.sigmoid(preds[0][0])
+            mask = quickstart_infer.infer_one(image_np, user_text)
 
             # Normalize mask to boolean like your previous post-processing
             if isinstance(mask, torch.Tensor):
@@ -132,7 +103,7 @@ def main():
                     mx, mn = float(mask.max()), float(mask.min())
                     if mx > 1.0 or mn < 0.0:
                         mask = torch.sigmoid(mask)
-                    mask = (mask >= 0.1).to(torch.uint8).numpy()
+                    mask = (mask >= 0.5).to(torch.uint8).numpy()
                 else:
                     mask = mask.to(torch.uint8).numpy()
             else:
@@ -142,13 +113,13 @@ def main():
                     mx, mn = float(mask.max()), float(mask.min())
                     if mx > 1.0 or mn < 0.0:
                         mask = 1 / (1 + np.exp(-mask))
-                    mask = (mask >= 0.1).astype(np.uint8)
+                    mask = (mask >= 0.5).astype(np.uint8)
                 else:
                     mask = mask.astype(np.uint8)
 
             # Ensure shape matches original for overlay; if needed, resize
-            if mask.shape != (H, W):
-                mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+            if mask.shape != image_np_bgr.shape[:2]:
+                mask = cv2.resize(mask, (image_np_bgr.shape[1], image_np_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
 
             combined = mask.astype(bool)
 
@@ -163,18 +134,13 @@ def main():
 
             # ---- save masked visualization (transparent red overlay) ----
             alpha = 0.5
-            ori = cv2.imread(str(image_path))
-            overlay = ori.copy()
-            overlay[combined] = (255, 0, 0)  # RGB red
-            vis_bgr = cv2.addWeighted(overlay, alpha, ori, 1 - alpha, 0)
+            overlay = image_np_bgr.copy()
+            overlay[combined] = (0, 0, 255)  # BGR red
+            vis_bgr = cv2.addWeighted(overlay, alpha, image_np_bgr, 1 - alpha, 0)
 
             ok = cv2.imwrite(str(outs["masked_out"]), vis_bgr)
             if not ok:
                 print(f"[ERROR] Failed to save masked image: {outs['masked_out']}")
-
-            ok = cv2.imwrite(str(outs["img_out"]), ori)
-            if not ok:
-                print(f"[ERROR] Failed to save original image: {outs['img_out']}")
 
 if __name__ == "__main__":
     main()
